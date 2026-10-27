@@ -174,3 +174,39 @@ func TestReadOnlyMode_MultipleSkippedPuts(t *testing.T) {
 		t.Errorf("Expected putCount to be 5, got: %d", cp.putCount.Load())
 	}
 }
+
+func TestPut_ExistingEntryWithDifferentOutput(t *testing.T) {
+	cp, cacheDir := createTestCacheProg(t, true)
+	defer os.RemoveAll(cacheDir)
+
+	put := func(outputID []byte, body string) Response {
+		t.Helper()
+		resp, err := cp.handlePut(&Request{
+			Command:  CmdPut,
+			ActionID: []byte("test-action-id-12345678"),
+			OutputID: outputID,
+			Body:     strings.NewReader(body),
+			BodySize: int64(len(body)),
+		})
+		if err != nil {
+			t.Fatalf("handlePut returned error: %v", err)
+		}
+		if resp.Err != "" {
+			t.Fatalf("Expected no error in response, got: %s", resp.Err)
+		}
+		return resp
+	}
+
+	// Go records the returned DiskPath as the file for the OutputID it sent, so a second PUT
+	// of the same action ID with a different output must return a file holding that output.
+	put([]byte("test-output-id-aaaaaaaa"), "first body")
+	resp := put([]byte("test-output-id-bbbbbbbb"), "other body")
+
+	got, err := os.ReadFile(resp.DiskPath)
+	if err != nil {
+		t.Fatalf("Failed to read DiskPath: %v", err)
+	}
+	if string(got) != "other body" {
+		t.Errorf("DiskPath holds %q, expected %q", got, "other body")
+	}
+}

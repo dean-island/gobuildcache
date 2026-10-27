@@ -412,8 +412,10 @@ func (cp *CacheProg) handlePut(req *Request) (Response, error) {
 		existingMeta := cp.localCache.check(req.ActionID)
 		cp.latencyTracker.Record("put_local_cache_check", time.Since(localCacheCheckStart))
 
-		if existingMeta != nil {
-			return &putResult{diskPath: cp.localCache.getPath(req.ActionID)}, nil
+		// Go maps the returned disk path to req.OutputID, so an entry holding a different
+		// output (e.g. from a non-reproducible build) must not be returned here.
+		if existingMeta != nil && bytes.Equal(existingMeta.OutputID, req.OutputID) {
+			return &putResult{diskPath: cp.localCache.getPath(existingMeta.OutputID)}, nil
 		}
 
 		// Read body into memory (we need to write it to both local cache and backend)
@@ -542,7 +544,7 @@ func (cp *CacheProg) handleGet(req *Request) (Response, error) {
 
 		if meta != nil {
 			// Local cache hit with metadata
-			diskPath := cp.localCache.getPath(req.ActionID)
+			diskPath := cp.localCache.getPath(meta.OutputID)
 
 			return &getResult{
 				outputID:       meta.OutputID,
