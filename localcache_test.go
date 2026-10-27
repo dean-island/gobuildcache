@@ -159,38 +159,69 @@ func TestLocalCacheConcurrentWritesOfOneActionIDWithDifferentOutputs(t *testing.
 	}
 }
 
-// TestLocalCacheIgnoresEntriesWithoutOutputFile checks that metadata whose output file is
-// missing, as for entries written before outputs were stored by output ID, is a miss.
-func TestLocalCacheIgnoresEntriesWithoutOutputFile(t *testing.T) {
+// TestLocalCacheIgnoresEntriesOfEarlierVersions checks that entries written by earlier
+// versions (data under the action ID, metadata in a ".meta" file) are a miss, and that
+// writing the entry again leaves them intact for an earlier version sharing the directory.
+func TestLocalCacheIgnoresEntriesOfEarlierVersions(t *testing.T) {
 	lc, cacheErr := newLocalCache(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if cacheErr != nil {
 		t.Fatalf("newLocalCache: %v", cacheErr)
 	}
 
 	var (
-		actionID = bytes.Repeat([]byte{0xab}, 32)
-		body     = []byte("payload")
-		meta     = localCacheMetadata{
+		actionID    = bytes.Repeat([]byte{0xab}, 32)
+		oldBody     = []byte("old payload")
+		oldMetaPath = lc.actionIDToPath(actionID) + ".meta"
+		oldMeta     = fmt.Sprintf("outputID:%s\nsize:%d\ntime:1700000000\n", strings.Repeat("ef", 32), len(oldBody))
+		body        = []byte("payload")
+		meta        = localCacheMetadata{
 			OutputID: bytes.Repeat([]byte{0xcd}, 32),
 			Size:     int64(len(body)),
 			PutTime:  time.Unix(1700000000, 0),
 		}
 	)
-	// The layout of earlier versions: the data file sits at the action ID's path.
-	if writeErr := os.WriteFile(lc.actionIDToPath(actionID), body, 0644); writeErr != nil {
+	if writeErr := os.WriteFile(lc.actionIDToPath(actionID), oldBody, 0644); writeErr != nil {
 		t.Fatalf("writing the old-layout data file: %v", writeErr)
+	}
+	if writeErr := os.WriteFile(oldMetaPath, []byte(oldMeta), 0644); writeErr != nil {
+		t.Fatalf("writing the old-layout metadata file: %v", writeErr)
+	}
+	if gotMeta := lc.check(actionID); gotMeta != nil {
+		t.Fatalf("check = %+v, want a miss for an entry of an earlier version", gotMeta)
+	}
+
+	if _, writeErr := lc.writeWithMetadata(actionID, bytes.NewReader(body), meta); writeErr != nil {
+		t.Fatalf("writeWithMetadata: %v", writeErr)
+	}
+	if gotMeta := lc.check(actionID); gotMeta == nil || !bytes.Equal(gotMeta.OutputID, meta.OutputID) {
+		t.Fatalf("check = %+v, want a hit for output %x", gotMeta, meta.OutputID)
+	}
+	if got, readErr := os.ReadFile(oldMetaPath); readErr != nil || string(got) != oldMeta {
+		t.Errorf("old-layout metadata = %q (err %v), want it unchanged", got, readErr)
+	}
+	if got, readErr := os.ReadFile(lc.actionIDToPath(actionID)); readErr != nil || !bytes.Equal(got, oldBody) {
+		t.Errorf("old-layout data file = %q (err %v), want it unchanged", got, readErr)
+	}
+}
+
+// TestLocalCacheIgnoresEntriesWithoutOutputFile checks that metadata whose output file is
+// missing is a miss, since Go would reject the hit anyway.
+func TestLocalCacheIgnoresEntriesWithoutOutputFile(t *testing.T) {
+	lc, cacheErr := newLocalCache(t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if cacheErr != nil {
+		t.Fatalf("newLocalCache: %v", cacheErr)
+	}
+
+	actionID := bytes.Repeat([]byte{0xab}, 32)
+	meta := localCacheMetadata{
+		OutputID: bytes.Repeat([]byte{0xcd}, 32),
+		Size:     7,
+		PutTime:  time.Unix(1700000000, 0),
 	}
 	if writeErr := lc.writeMetadata(actionID, meta); writeErr != nil {
 		t.Fatalf("writeMetadata: %v", writeErr)
 	}
 	if gotMeta := lc.check(actionID); gotMeta != nil {
 		t.Fatalf("check = %+v, want a miss for an entry without an output file", gotMeta)
-	}
-
-	if _, writeErr := lc.writeWithMetadata(actionID, bytes.NewReader(body), meta); writeErr != nil {
-		t.Fatalf("writeWithMetadata: %v", writeErr)
-	}
-	if gotMeta := lc.check(actionID); gotMeta == nil {
-		t.Fatal("check = nil, want a hit once the entry is rewritten")
 	}
 }

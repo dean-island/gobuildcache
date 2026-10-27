@@ -227,9 +227,8 @@ func (lc *localCache) check(actionID []byte) *localCacheMetadata {
 		return nil
 	}
 
-	// The output file must be checked too: metadata written before outputs were stored
-	// by output ID references a file that doesn't exist, and Go rejects a hit whose file
-	// is missing. Treating it as a miss lets the entry be refetched and rewritten.
+	// Go rejects a hit whose output file is missing or has the wrong size, so treat
+	// it as a miss here instead, which lets the entry be refetched and rewritten.
 	info, statErr := os.Stat(lc.outputIDToPath(meta.OutputID))
 	if statErr != nil || info.Size() != meta.Size {
 		if statErr == nil || !errors.Is(statErr, os.ErrNotExist) {
@@ -266,8 +265,13 @@ func (lc *localCache) outputIDToPath(outputID []byte) string {
 }
 
 // metadataPath returns the path to the metadata file for an actionID.
+//
+// The ".meta2" suffix keeps this layout apart from earlier versions, whose ".meta"
+// files point at data stored under the action ID. Versions sharing one cache
+// directory, or a downgrade, would otherwise read each other's metadata and return
+// a data file that is missing or holds a different output.
 func (lc *localCache) metadataPath(actionID []byte) string {
-	return lc.actionIDToPath(actionID) + ".meta"
+	return lc.actionIDToPath(actionID) + ".meta2"
 }
 
 // GetPath returns the absolute path for an outputID in the local cache.
