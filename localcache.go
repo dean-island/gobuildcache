@@ -160,10 +160,16 @@ func (lc *localCache) readMetadata(actionID []byte) (*localCacheMetadata, error)
 	}, nil
 }
 
-// Write atomically writes data from a reader to the local cache.
+// Write atomically writes the output identified by outputID from a reader to the local cache.
 // Returns the absolute path to the cached file.
-func (lc *localCache) write(actionID []byte, body io.Reader) (string, error) {
-	diskPath := lc.actionIDToPath(actionID)
+func (lc *localCache) write(outputID []byte, size int64, body io.Reader) (string, error) {
+	diskPath := lc.outputIDToPath(outputID)
+
+	// Outputs are content-addressed and only ever renamed into place whole, so an
+	// existing file of the right size already holds these bytes.
+	if info, statErr := os.Stat(diskPath); statErr == nil && info.Size() == size {
+		return diskPath, nil
+	}
 
 	if err := writeFileAtomically(diskPath, body); err != nil {
 		return "", fmt.Errorf("failed to write cache file: %w", err)
@@ -175,9 +181,18 @@ func (lc *localCache) write(actionID []byte, body io.Reader) (string, error) {
 
 // WriteWithMetadata writes data and metadata to the local cache.
 // Returns the absolute path to the cached file.
+//
+// The data is stored under meta.OutputID and the metadata under actionID, and the data
+// is written first. Concurrent writers of one action ID with different outputs therefore
+// never leave metadata pointing at another writer's data: whichever metadata wins
+// references an output file that was complete before the metadata was written.
 func (lc *localCache) writeWithMetadata(actionID []byte, body io.Reader, meta localCacheMetadata) (string, error) {
+	if len(meta.OutputID) == 0 {
+		return "", fmt.Errorf("missing output ID for action ID %s", hex.EncodeToString(actionID))
+	}
+
 	// Write data
-	diskPath, err := lc.write(actionID, body)
+	diskPath, err := lc.write(meta.OutputID, meta.Size, body)
 	if err != nil {
 		return "", err
 	}
@@ -193,15 +208,14 @@ func (lc *localCache) writeWithMetadata(actionID []byte, body io.Reader, meta lo
 	return diskPath, nil
 }
 
-// Check checks if a file exists in the local cache and returns its metadata.
-// Returns nil if not found, and logs a warning if metadata is missing/corrupted.
+// Check checks if an entry exists in the local cache and returns its metadata.
+// Returns nil if not found, and logs a warning if metadata is corrupted or the
+// output file it references is missing or has the wrong size.
 func (lc *localCache) check(actionID []byte) *localCacheMetadata {
-	// Try to read metadata directly (avoids extra Stat syscall)
-	// If the data file doesn't exist, the metadata file likely won't either
 	meta, err := lc.readMetadata(actionID)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			// Neither data nor metadata exists - this is a cache miss
+			// No metadata exists - this is a cache miss
 			return nil
 		}
 
@@ -210,16 +224,20 @@ func (lc *localCache) check(actionID []byte) *localCacheMetadata {
 			"actionID", hex.EncodeToString(actionID),
 			"error", err,
 		)
+		return nil
+	}
 
-		// Metadata is missing or corrupted but data file might exist
-		// Check if data file exists
-		diskPath := lc.actionIDToPath(actionID)
-		if _, statErr := os.Stat(diskPath); statErr == nil {
-			// Data file exists but metadata is missing/corrupted
+	// The output file must be checked too: metadata written before outputs were stored
+	// by output ID references a file that doesn't exist, and Go rejects a hit whose file
+	// is missing. Treating it as a miss lets the entry be refetched and rewritten.
+	info, statErr := os.Stat(lc.outputIDToPath(meta.OutputID))
+	if statErr != nil || info.Size() != meta.Size {
+		if statErr == nil || !errors.Is(statErr, os.ErrNotExist) {
 			lc.logger.Warn(
-				"local cache file exists but metadata is missing/corrupted",
+				"local cache output file does not match metadata",
 				"actionID", hex.EncodeToString(actionID),
-				"error", err,
+				"outputID", hex.EncodeToString(meta.OutputID),
+				"error", statErr,
 			)
 		}
 		return nil
@@ -228,7 +246,7 @@ func (lc *localCache) check(actionID []byte) *localCacheMetadata {
 	return meta
 }
 
-// actionIDToPath converts an actionID to a local cache file path.
+// actionIDToPath converts an actionID to the base path of its local cache entry.
 // Files are organized into 256 subdirectories (00-ff) based on the first byte
 // of the action ID, similar to Go's build cache structure.
 func (lc *localCache) actionIDToPath(actionID []byte) string {
@@ -239,14 +257,22 @@ func (lc *localCache) actionIDToPath(actionID []byte) string {
 	return filepath.Join(lc.cacheDir, subdir, hexID)
 }
 
+// outputIDToPath converts an outputID to the path of its output file, using the
+// same subdirectory layout as actionIDToPath. The "-d" suffix keeps output files
+// apart from metadata files and from data files written under action IDs by
+// earlier versions.
+func (lc *localCache) outputIDToPath(outputID []byte) string {
+	return lc.actionIDToPath(outputID) + "-d"
+}
+
 // metadataPath returns the path to the metadata file for an actionID.
 func (lc *localCache) metadataPath(actionID []byte) string {
 	return lc.actionIDToPath(actionID) + ".meta"
 }
 
-// GetPath returns the absolute path for an actionID in the local cache.
+// GetPath returns the absolute path for an outputID in the local cache.
 // Does not check if the file actually exists.
-func (lc *localCache) getPath(actionID []byte) string {
+func (lc *localCache) getPath(outputID []byte) string {
 	// Since cacheDir is already absolute, the path is already absolute
-	return lc.actionIDToPath(actionID)
+	return lc.outputIDToPath(outputID)
 }
