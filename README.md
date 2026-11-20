@@ -399,7 +399,8 @@ All environment variables support both `GOBUILDCACHE_<KEY>` and `<KEY>` forms (e
 | (env var only) | `GOBUILDCACHE_AZURE_ACCOUNT` | (none) | Azure storage account name (used with `DefaultAzureCredential`) |
 | (env var only) | `GOBUILDCACHE_AZURE_STORAGE_CONNECTION_STRING` | (none) | Azure connection string (takes precedence over `AZURE_ACCOUNT`) |
 | `-debug` | `GOBUILDCACHE_DEBUG` | `false` | Enable debug logging |
-| `-stats` | `GOBUILDCACHE_PRINT_STATS` | `false` | Print cache statistics on exit |
+| `-stats` | `GOBUILDCACHE_PRINT_STATS` | `true` | Print cache statistics on exit |
+| `-stats-dir` | `GOBUILDCACHE_STATS_DIR` | (empty, disabled) | Directory to write a JSON statistics file to on exit, one `gobuildcache-stats-<unixnanos>-<pid>.json` per process. Works independently of `-stats` |
 | `-read-only` | `GOBUILDCACHE_READ_ONLY` | `false` | Read-only mode: allow cache reads but skip writes |
 | `-backend-fallback` | `GOBUILDCACHE_BACKEND_FALLBACK` | `false` | Never fail a build on backend errors: failed GETs become misses, failed PUTs are dropped, and the build uses only the local cache if the backend is unreachable at startup or fails 5 times in a row. Failures are logged as warnings |
 | `-backend-timeout` | `GOBUILDCACHE_BACKEND_TIMEOUT` | `0` (none) | Timeout for each backend request, in Go duration syntax (e.g. `10s`). It covers reading a GET body, so leave room for large objects. S3 only |
