@@ -82,7 +82,7 @@ func NewS3(bucket, prefix string, awsCfg S3Config) (*S3, error) {
 	}
 
 	// Test bucket access
-	headCtx, cancel := backend.requestContext()
+	headCtx, cancel := requestContext(backend.ctx, backend.timeout)
 	defer cancel()
 	_, err = client.HeadBucket(headCtx, &s3.HeadBucketInput{
 		Bucket: aws.String(bucket),
@@ -127,7 +127,7 @@ func (s *S3) Put(actionID, outputID []byte, body io.Reader, bodySize int64) erro
 		Metadata: metadata,
 	}
 
-	ctx, cancel := s.requestContext()
+	ctx, cancel := requestContext(s.ctx, s.timeout)
 	defer cancel()
 	_, err := s.client.PutObject(ctx, putInput)
 	if err != nil {
@@ -148,7 +148,7 @@ func (s *S3) Get(actionID []byte) ([]byte, io.ReadCloser, int64, *time.Time, boo
 		Key:    aws.String(key),
 	}
 
-	ctx, cancel := s.requestContext()
+	ctx, cancel := requestContext(s.ctx, s.timeout)
 	result, err := s.client.GetObject(ctx, getInput)
 	if err != nil {
 		cancel()
@@ -188,27 +188,7 @@ func (s *S3) Get(actionID []byte) ([]byte, io.ReadCloser, int64, *time.Time, boo
 
 	// Return the S3 object body as a ReadCloser
 	// The caller is responsible for closing it, which also releases the request context
-	return outputID, &cancelOnClose{ReadCloser: result.Body, cancel: cancel}, size, &putTime, false, nil
-}
-
-// requestContext returns the context for one S3 request, bounded by the configured timeout.
-func (s *S3) requestContext() (context.Context, context.CancelFunc) {
-	if s.timeout > 0 {
-		return context.WithTimeout(s.ctx, s.timeout)
-	}
-	return context.WithCancel(s.ctx)
-}
-
-// cancelOnClose cancels a GET's request context once the caller is done reading the body.
-type cancelOnClose struct {
-	io.ReadCloser
-	cancel context.CancelFunc
-}
-
-func (c *cancelOnClose) Close() error {
-	err := c.ReadCloser.Close()
-	c.cancel()
-	return err
+	return outputID, wrapBodyWithCancel(result.Body, cancel, s.timeout > 0), size, &putTime, false, nil
 }
 
 // Close performs cleanup operations.

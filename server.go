@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -72,13 +73,14 @@ type CacheProg struct {
 		w *bufio.Writer
 	}
 
-	debug       bool
-	printStats  bool
-	compression bool
-	readOnly    bool
-	statsDir    string
-	logger      *slog.Logger
-	startTime   time.Time
+	debug           bool
+	printStats      bool
+	compression     bool
+	readOnly        bool
+	backendFallback bool
+	statsDir        string
+	logger          *slog.Logger
+	startTime       time.Time
 
 	// Latency tracking using DDSketch for quantile estimation.
 	latencyTracker *metrics.LatencyTracker
@@ -133,6 +135,7 @@ func NewCacheProg(
 	compression bool,
 	readOnly bool,
 	statsDir string,
+	backendFallback bool,
 ) (*CacheProg, error) {
 	logLevel := slog.LevelInfo
 	if debug {
@@ -149,18 +152,19 @@ func NewCacheProg(
 	}
 
 	cp := &CacheProg{
-		backend:        backend,
-		localCache:     localCache,
-		reader:         bufio.NewReader(os.Stdin),
-		debug:          debug,
-		printStats:     printStats,
-		compression:    compression,
-		readOnly:       readOnly,
-		statsDir:       statsDir,
-		logger:         logger,
-		startTime:      time.Now(),
-		locker:         sfGroup,
-		latencyTracker: metrics.NewLatencyTracker(0.01), // 1% relative accuracy
+		backend:         backend,
+		localCache:      localCache,
+		reader:          bufio.NewReader(os.Stdin),
+		debug:           debug,
+		printStats:      printStats,
+		compression:     compression,
+		readOnly:        readOnly,
+		backendFallback: backendFallback,
+		statsDir:        statsDir,
+		logger:          logger,
+		startTime:       time.Now(),
+		locker:          sfGroup,
+		latencyTracker:  metrics.NewLatencyTracker(0.01), // 1% relative accuracy
 	}
 	cp.writer.w = bufio.NewWriter(os.Stdout)
 	cp.seenActionIDs.ids = make(map[string]int)
@@ -661,9 +665,14 @@ func (cp *CacheProg) handlePut(req *Request) (Response, error) {
 		if err != nil {
 			// Local cache is still valid even if backend fails
 			cp.failedBackendPuts.Add(1)
-			cp.logger.Warn("backend PUT failed, but local cache succeeded",
-				"actionID", hex.EncodeToString(req.ActionID),
-				"error", err)
+			if errors.Is(err, backends.ErrCircuitOpen) {
+				cp.logger.Debug("backend PUT skipped (circuit open)",
+					"actionID", hex.EncodeToString(req.ActionID))
+			} else {
+				cp.logger.Warn("backend PUT failed, but local cache succeeded",
+					"actionID", hex.EncodeToString(req.ActionID),
+					"error", err)
+			}
 		} else {
 			// Track bytes written to backend on success (actual bytes transferred)
 			cp.backendBytesWritten.Add(dataSize)
@@ -740,7 +749,7 @@ func (cp *CacheProg) handleGet(req *Request) (Response, error) {
 		cp.latencyTracker.Record("get_backend", time.Since(backendGetStart))
 
 		if err != nil {
-			return nil, err
+			return cp.handleBackendGetError(req.ActionID, err)
 		}
 
 		if miss {
@@ -750,20 +759,20 @@ func (cp *CacheProg) handleGet(req *Request) (Response, error) {
 			}, nil
 		}
 
-		// Backend hit - track bytes read from backend (compressed size)
-		cp.backendBytesRead.Add(size)
-
 		// Backend hit - decompress if needed, then write to local cache with metadata
 		defer body.Close()
 
-		var dataToCache io.Reader
-		var actualSize int64
+		var (
+			dataToCache io.Reader
+			actualSize  int64
+			bodyReadErr error
+		)
 
 		if cp.compression && size > 0 {
 			// Read compressed data from backend
 			compressedData, err := io.ReadAll(body)
 			if err != nil {
-				return nil, fmt.Errorf("failed to read compressed data from backend: %w", err)
+				return cp.handleBackendGetError(req.ActionID, fmt.Errorf("failed to read compressed data from backend: %w", err))
 			}
 
 			// Decompress data
@@ -772,7 +781,7 @@ func (cp *CacheProg) handleGet(req *Request) (Response, error) {
 			cp.latencyTracker.Record("get_decompression", time.Since(decompressStart))
 
 			if err != nil {
-				return nil, fmt.Errorf("failed to decompress data: %w", err)
+				return cp.handleBackendGetError(req.ActionID, fmt.Errorf("failed to decompress data: %w", err))
 			}
 
 			// Track decompression statistics
@@ -782,7 +791,7 @@ func (cp *CacheProg) handleGet(req *Request) (Response, error) {
 			dataToCache = bytes.NewReader(decompressed)
 			actualSize = int64(len(decompressed))
 		} else {
-			dataToCache = body
+			dataToCache = &errTrackingReader{r: body, err: &bodyReadErr}
 			actualSize = size
 		}
 
@@ -797,13 +806,17 @@ func (cp *CacheProg) handleGet(req *Request) (Response, error) {
 		cp.latencyTracker.Record("get_local_cache_write", time.Since(localCacheWriteStart))
 
 		if err != nil {
+			if bodyReadErr != nil {
+				return cp.handleBackendGetError(req.ActionID, fmt.Errorf("failed to read data from backend: %w", bodyReadErr))
+			}
 			cp.logger.Warn("failed to write to local cache after backend hit",
 				"actionID", hex.EncodeToString(req.ActionID),
 				"error", err)
-			// We got data from backend but couldn't cache it locally
-			// This is not fatal - we can still serve from backend
 			return nil, fmt.Errorf("failed to cache locally: %w", err)
 		}
+
+		// Backend hit - track bytes read from backend (compressed size)
+		cp.backendBytesRead.Add(size)
 
 		return &getResult{
 			outputID:       outputID,
@@ -837,6 +850,41 @@ func (cp *CacheProg) handleGet(req *Request) (Response, error) {
 		resp.Time = result.putTime
 	}
 	return resp, nil
+}
+
+// handleBackendGetError either propagates err (default) or, when
+// backendFallback is enabled, records the failure and converts it into a clean
+// cache miss so Go rebuilds locally instead of failing the build.
+func (cp *CacheProg) handleBackendGetError(actionID []byte, err error) (*getResult, error) {
+	if !cp.backendFallback {
+		return nil, err
+	}
+	cp.failedGets.Add(1)
+	if errors.Is(err, backends.ErrCircuitOpen) {
+		cp.logger.Debug("backend GET skipped (circuit open), treating as cache miss",
+			"actionID", hex.EncodeToString(actionID))
+	} else {
+		cp.logger.Warn("backend GET failed, treating as cache miss",
+			"actionID", hex.EncodeToString(actionID),
+			"error", err)
+	}
+	return &getResult{miss: true}, nil
+}
+
+// errTrackingReader records the first non-EOF error returned by r so handleGet
+// can distinguish a backend body read failure from a local disk write failure
+// when streaming an uncompressed object into the local cache.
+type errTrackingReader struct {
+	r   io.Reader
+	err *error
+}
+
+func (e *errTrackingReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err != nil && err != io.EOF && *e.err == nil {
+		*e.err = err
+	}
+	return n, err
 }
 
 // sendResponse sends a response to stdout (thread-safe).

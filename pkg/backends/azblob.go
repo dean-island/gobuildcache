@@ -35,6 +35,8 @@ type AzBlobConfig struct {
 	// access signature. A user delegation SAS (signed with Entra credentials
 	// rather than the account key) is recommended. A leading "?" is optional.
 	SASToken string
+	// Timeout bounds each Azure request, including reading a GET body. Zero means no limit.
+	Timeout time.Duration
 }
 
 // AzBlob implements Backend using Azure Blob Storage.
@@ -44,6 +46,7 @@ type AzBlob struct {
 	container string
 	prefix    string
 	ctx       context.Context
+	timeout   time.Duration
 }
 
 // NewAzBlob creates a new Azure Blob Storage-based cache backend.
@@ -101,11 +104,14 @@ func NewAzBlob(containerName, prefix string, cfg AzBlobConfig) (*AzBlob, error) 
 		container: containerName,
 		prefix:    prefix,
 		ctx:       ctx,
+		timeout:   cfg.Timeout,
 	}
 
 	// Test container access by fetching its properties (mirrors the GCS bucket
 	// Attrs check).
-	if _, err := client.ServiceClient().NewContainerClient(containerName).GetProperties(ctx, nil); err != nil {
+	propsCtx, cancel := requestContext(ctx, cfg.Timeout)
+	defer cancel()
+	if _, err := client.ServiceClient().NewContainerClient(containerName).GetProperties(propsCtx, nil); err != nil {
 		return nil, fmt.Errorf("failed to access Azure container %s: %w", containerName, err)
 	}
 
@@ -128,7 +134,9 @@ func (a *AzBlob) Put(actionID, outputID []byte, body io.Reader, bodySize int64) 
 		body = strings.NewReader("")
 	}
 
-	_, err := a.client.UploadStream(a.ctx, a.container, key, body, &azblob.UploadStreamOptions{
+	ctx, cancel := requestContext(a.ctx, a.timeout)
+	defer cancel()
+	_, err := a.client.UploadStream(ctx, a.container, key, body, &azblob.UploadStreamOptions{
 		Metadata: meta,
 	})
 	if err != nil {
@@ -143,8 +151,10 @@ func (a *AzBlob) Put(actionID, outputID []byte, body io.Reader, bodySize int64) 
 func (a *AzBlob) Get(actionID []byte) ([]byte, io.ReadCloser, int64, *time.Time, bool, error) {
 	key := a.actionIDToKey(actionID)
 
-	resp, err := a.client.DownloadStream(a.ctx, a.container, key, nil)
+	ctx, cancel := requestContext(a.ctx, a.timeout)
+	resp, err := a.client.DownloadStream(ctx, a.container, key, nil)
 	if err != nil {
+		cancel()
 		if bloberror.HasCode(err, bloberror.BlobNotFound) {
 			return nil, nil, 0, nil, true, nil
 		}
@@ -158,6 +168,7 @@ func (a *AzBlob) Get(actionID []byte) ([]byte, io.ReadCloser, int64, *time.Time,
 		if resp.Body != nil {
 			resp.Body.Close()
 		}
+		cancel()
 		return nil, nil, 0, nil, true, nil
 	}
 
@@ -166,7 +177,7 @@ func (a *AzBlob) Get(actionID []byte) ([]byte, io.ReadCloser, int64, *time.Time,
 	size := parseSize(meta["size"], resp.ContentLength)
 	putTime := parsePutTime(meta["time"], resp.LastModified)
 
-	return outputID, resp.Body, size, putTime, false, nil
+	return outputID, wrapBodyWithCancel(resp.Body, cancel, a.timeout > 0), size, putTime, false, nil
 }
 
 // normalizeMetadata lower-cases metadata keys, since Azure canonicalizes them

@@ -2,12 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/richardartoul/gobuildcache/pkg/backends"
 	"github.com/richardartoul/gobuildcache/pkg/locking"
@@ -52,7 +54,7 @@ func createTestCacheProg(t *testing.T, readOnly bool) (*CacheProg, string) {
 	backend := backends.NewNoop()
 	locker := locking.NewNoOpGroup()
 
-	cp, err := NewCacheProg(backend, locker, cacheDir, false, false, false, readOnly, "")
+	cp, err := NewCacheProg(backend, locker, cacheDir, false, false, false, readOnly, "", false)
 	if err != nil {
 		os.RemoveAll(cacheDir)
 		t.Fatalf("Failed to create CacheProg: %v", err)
@@ -340,7 +342,7 @@ func TestWriteStatsFile_FailureCounters(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			backend := tt.backend()
-			cp, err := NewCacheProg(backend, locking.NewNoOpGroup(), t.TempDir(), false, false, false, false, "")
+			cp, err := NewCacheProg(backend, locking.NewNoOpGroup(), t.TempDir(), false, false, false, false, "", false)
 			if err != nil {
 				t.Fatalf("Failed to create CacheProg: %v", err)
 			}
@@ -388,6 +390,154 @@ func TestWriteStatsFile_FailureCounters(t *testing.T) {
 			for key, wantVal := range want {
 				if got[key] != wantVal {
 					t.Errorf("%s = %v, expected %v", key, got[key], wantVal)
+				}
+			}
+		})
+	}
+}
+
+type stubBodyFailBackend struct {
+	bodyErr error
+	data    []byte
+	gets    int
+}
+
+type errBodyReader struct {
+	err error
+}
+
+func (r *errBodyReader) Read([]byte) (int, error) { return 0, r.err }
+func (r *errBodyReader) Close() error             { return nil }
+
+func (b *stubBodyFailBackend) Put([]byte, []byte, io.Reader, int64) error { return nil }
+func (b *stubBodyFailBackend) Close() error                               { return nil }
+func (b *stubBodyFailBackend) Clear() error                               { return nil }
+func (b *stubBodyFailBackend) Get([]byte) ([]byte, io.ReadCloser, int64, *time.Time, bool, error) {
+	b.gets++
+	now := time.Now()
+	if b.bodyErr != nil {
+		return []byte("output-1"), &errBodyReader{err: b.bodyErr}, 16, &now, false, nil
+	}
+	return []byte("output-1"), io.NopCloser(strings.NewReader(string(b.data))), int64(len(b.data)), &now, false, nil
+}
+
+func TestBackendFallback_GetBodyReadErrorsBecomeMissesAndTripBreaker(t *testing.T) {
+	for _, compressed := range []bool{false, true} {
+		name := "uncompressed"
+		if compressed {
+			name = "compressed"
+		}
+		t.Run(name, func(t *testing.T) {
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			inner := &stubBodyFailBackend{bodyErr: errors.New("body read timeout")}
+			cb := backends.NewCircuitBreaker(inner, 2, logger)
+
+			cp, err := NewCacheProg(cb, locking.NewNoOpGroup(), t.TempDir(), false, false, compressed, false, "", true)
+			if err != nil {
+				t.Fatalf("NewCacheProg: %v", err)
+			}
+
+			// First 2 GETs fail during body read -> clean misses, and trip the breaker.
+			// Third GET short-circuits via ErrCircuitOpen -> clean miss without calling inner.
+			for i := range 3 {
+				resp, err := cp.handleGet(&Request{
+					Command:  CmdGet,
+					ActionID: []byte("action-" + string(rune('a'+i))),
+				})
+				if err != nil || resp.Err != "" || !resp.Miss {
+					t.Fatalf("call %d: handleGet = (miss=%v, resp.Err=%q, err=%v), want clean miss", i, resp.Miss, resp.Err, err)
+				}
+			}
+
+			if !cb.Tripped() {
+				t.Errorf("expected circuit breaker to trip on repeated body read failures")
+			}
+			if inner.gets != 2 {
+				t.Errorf("inner.gets = %d, want 2 (third call should short-circuit)", inner.gets)
+			}
+			if got := cp.failedGets.Load(); got != 3 {
+				t.Errorf("failedGets = %d, want 3", got)
+			}
+			if got := cp.backendBytesRead.Load(); got != 0 {
+				t.Errorf("backendBytesRead = %d, want 0 for failed body reads", got)
+			}
+		})
+	}
+}
+
+func TestBackendFallback_CorruptCompressedObjectBecomesMiss(t *testing.T) {
+	inner := &stubBodyFailBackend{data: []byte("not-valid-lz4-frame")}
+	cp, err := NewCacheProg(inner, locking.NewNoOpGroup(), t.TempDir(), false, false, true, false, "", true)
+	if err != nil {
+		t.Fatalf("NewCacheProg: %v", err)
+	}
+
+	resp, err := cp.handleGet(&Request{Command: CmdGet, ActionID: []byte("action-corrupt")})
+	if err != nil || resp.Err != "" || !resp.Miss {
+		t.Fatalf("handleGet = (miss=%v, resp.Err=%q, err=%v), want clean miss", resp.Miss, resp.Err, err)
+	}
+	if got := cp.failedGets.Load(); got != 1 {
+		t.Errorf("failedGets = %d, want 1", got)
+	}
+}
+
+func TestBackendFallback_PreservesFailureStatsAndByteAccounting(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	for _, async := range []bool{false, true} {
+		name := "sync"
+		if async {
+			name = "async"
+		}
+		t.Run(name, func(t *testing.T) {
+			var b backends.Backend = backends.NewError(backends.NewNoop(), 1.0)
+			b = backends.NewCircuitBreaker(b, 2, logger)
+			if async {
+				b = backends.NewAsyncBackendWriter(b, logger)
+			}
+
+			cp, err := NewCacheProg(b, locking.NewNoOpGroup(), t.TempDir(), false, false, false, false, "", true)
+			if err != nil {
+				t.Fatalf("NewCacheProg: %v", err)
+			}
+
+			// GET fails -> clean miss, still counted in failed_gets.
+			resp, err := cp.handleGet(&Request{Command: CmdGet, ActionID: []byte("action-get")})
+			if err != nil || resp.Err != "" || !resp.Miss {
+				t.Fatalf("handleGet = (miss=%v, resp.Err=%q, err=%v), want clean miss", resp.Miss, resp.Err, err)
+			}
+
+			// PUT fails in backend -> local write succeeds, failure still counted in failed_backend_puts.
+			body := "compiled object bytes"
+			putResp, err := cp.handlePut(&Request{
+				Command:  CmdPut,
+				ActionID: []byte("action-put"),
+				OutputID: []byte("output-1"),
+				Body:     strings.NewReader(body),
+				BodySize: int64(len(body)),
+			})
+			if err != nil || putResp.Err != "" || putResp.DiskPath == "" {
+				t.Fatalf("handlePut = (diskPath=%q, resp.Err=%q, err=%v), want local success", putResp.DiskPath, putResp.Err, err)
+			}
+
+			_ = b.Close()
+
+			stats := writeAndReadStatsFile(t, cp)
+			if stats["failed_gets"] != float64(1) {
+				t.Errorf("failed_gets = %v, want 1", stats["failed_gets"])
+			}
+			if stats["failed_backend_puts"] != float64(1) {
+				t.Errorf("failed_backend_puts = %v, want 1", stats["failed_backend_puts"])
+			}
+			if !async && stats["backend_bytes_written"] != float64(0) {
+				t.Errorf("backend_bytes_written = %v, want 0 on failed sync PUT", stats["backend_bytes_written"])
+			}
+			if abw, ok := b.(*backends.AsyncBackendWriter); ok {
+				if abw.Stats().SuccessPuts != 0 {
+					t.Errorf("async SuccessPuts = %d, want 0", abw.Stats().SuccessPuts)
+				}
+				if abw.Stats().FailedPuts != 1 {
+					t.Errorf("async FailedPuts = %d, want 1", abw.Stats().FailedPuts)
 				}
 			}
 		})

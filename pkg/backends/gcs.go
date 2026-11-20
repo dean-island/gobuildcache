@@ -16,19 +16,26 @@ import (
 	"google.golang.org/api/option"
 )
 
+// GCSConfig holds GCS-specific configuration for the GCS backend.
+type GCSConfig struct {
+	// Timeout bounds each GCS request, including reading a GET body. Zero means no limit.
+	Timeout time.Duration
+}
+
 // GCS implements Backend using Google Cloud Storage.
 // This backend only handles GCS operations; local disk caching is handled by server.go.
 type GCS struct {
-	client *storage.Client
-	bucket *storage.BucketHandle
-	prefix string
-	ctx    context.Context
+	client  *storage.Client
+	bucket  *storage.BucketHandle
+	prefix  string
+	ctx     context.Context
+	timeout time.Duration
 }
 
 // NewGCS creates a new GCS-based cache backend.
 // bucket is the GCS bucket name where cache files will be stored.
 // prefix is an optional prefix for all GCS object names (e.g., "cache/" or "").
-func NewGCS(bucket, prefix string) (*GCS, error) {
+func NewGCS(bucket, prefix string, cfg GCSConfig) (*GCS, error) {
 	ctx := context.Background()
 
 	// Build client options. WithJSONReads forces the JSON API for downloads
@@ -50,14 +57,17 @@ func NewGCS(bucket, prefix string) (*GCS, error) {
 	bucketHandle := client.Bucket(bucket)
 
 	backend := &GCS{
-		client: client,
-		bucket: bucketHandle,
-		prefix: prefix,
-		ctx:    ctx,
+		client:  client,
+		bucket:  bucketHandle,
+		prefix:  prefix,
+		ctx:     ctx,
+		timeout: cfg.Timeout,
 	}
 
 	// Test bucket access by checking if bucket exists
-	_, err = bucketHandle.Attrs(ctx)
+	attrsCtx, cancel := requestContext(ctx, cfg.Timeout)
+	defer cancel()
+	_, err = bucketHandle.Attrs(attrsCtx)
 	if err != nil {
 		client.Close()
 		return nil, fmt.Errorf("failed to access GCS bucket %s: %w", bucket, err)
@@ -71,8 +81,11 @@ func (g *GCS) Put(actionID, outputID []byte, body io.Reader, bodySize int64) err
 	key := g.actionIDToKey(actionID)
 	obj := g.bucket.Object(key)
 
+	ctx, cancel := requestContext(g.ctx, g.timeout)
+	defer cancel()
+
 	// Create a writer for the object
-	writer := obj.NewWriter(g.ctx)
+	writer := obj.NewWriter(ctx)
 	defer writer.Close()
 
 	// Set metadata
@@ -107,9 +120,12 @@ func (g *GCS) Get(actionID []byte) ([]byte, io.ReadCloser, int64, *time.Time, bo
 	key := g.actionIDToKey(actionID)
 	obj := g.bucket.Object(key)
 
+	ctx, cancel := requestContext(g.ctx, g.timeout)
+
 	// Get object attributes first to check if it exists and get metadata
-	attrs, err := obj.Attrs(g.ctx)
+	attrs, err := obj.Attrs(ctx)
 	if err != nil {
+		cancel()
 		if errors.Is(err, storage.ErrObjectNotExist) {
 			return nil, nil, 0, nil, true, nil
 		}
@@ -123,6 +139,7 @@ func (g *GCS) Get(actionID []byte) ([]byte, io.ReadCloser, int64, *time.Time, bo
 
 	outputID, err := hex.DecodeString(outputIDHex)
 	if err != nil {
+		cancel()
 		return nil, nil, 0, nil, true, nil
 	}
 
@@ -146,8 +163,9 @@ func (g *GCS) Get(actionID []byte) ([]byte, io.ReadCloser, int64, *time.Time, bo
 	}
 
 	// Get a reader for the object
-	reader, err := obj.NewReader(g.ctx)
+	reader, err := obj.NewReader(ctx)
 	if err != nil {
+		cancel()
 		if errors.Is(err, storage.ErrObjectNotExist) {
 			return nil, nil, 0, nil, true, nil
 		}
@@ -155,8 +173,8 @@ func (g *GCS) Get(actionID []byte) ([]byte, io.ReadCloser, int64, *time.Time, bo
 	}
 
 	// Return the GCS object body as a ReadCloser
-	// The caller is responsible for closing it
-	return outputID, reader, size, putTime, false, nil
+	// The caller is responsible for closing it, which also releases the request context
+	return outputID, wrapBodyWithCancel(reader, cancel, g.timeout > 0), size, putTime, false, nil
 }
 
 // Close performs cleanup operations.

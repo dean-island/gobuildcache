@@ -2,6 +2,7 @@ package backends
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -70,11 +71,17 @@ func (abw *AsyncBackendWriter) Put(actionID, outputID []byte, body io.Reader, bo
 
 		if err != nil {
 			abw.failedPuts.Add(1)
-			abw.logger.Warn("async backend PUT failed",
-				"actionID", fmt.Sprintf("%x", actionID[:min(8, len(actionID))]),
-				"size", bodySize,
-				"duration", duration,
-				"error", err)
+			if errors.Is(err, ErrCircuitOpen) {
+				abw.logger.Debug("async backend PUT skipped (circuit open)",
+					"actionID", fmt.Sprintf("%x", actionID[:min(8, len(actionID))]),
+					"size", bodySize)
+			} else {
+				abw.logger.Warn("async backend PUT failed",
+					"actionID", fmt.Sprintf("%x", actionID[:min(8, len(actionID))]),
+					"size", bodySize,
+					"duration", duration,
+					"error", err)
+			}
 		} else {
 			abw.successPuts.Add(1)
 			abw.logger.Debug("async backend PUT succeeded",

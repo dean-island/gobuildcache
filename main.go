@@ -36,10 +36,6 @@ var (
 	backendTimeout  time.Duration
 )
 
-// fallbackMaxConsecutiveErrors is how many backend failures in a row switch
-// a build to the local cache only when -backend-fallback is set.
-const fallbackMaxConsecutiveErrors = 5
-
 func main() {
 	// Check if we have a subcommand
 	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
@@ -92,8 +88,7 @@ func runServerCommand() {
 		asyncBackendDefault    = getEnvBoolWithPrefix("ASYNC_BACKEND", true)
 		readOnlyDefault        = getEnvBoolWithPrefix("READ_ONLY", false)
 		backendFallbackDefault = getEnvBoolWithPrefix("BACKEND_FALLBACK", false)
-		// Invalid values fall back to 0 (no timeout), like the other env helpers.
-		backendTimeoutDefault, _ = time.ParseDuration(getEnvWithPrefix("BACKEND_TIMEOUT", "0"))
+		backendTimeoutDefault  = getEnvDurationWithPrefix("BACKEND_TIMEOUT", 0)
 	)
 	serverFlags.BoolVar(&debug, "debug", debugDefault, "Enable debug logging to stderr (env: DEBUG)")
 	serverFlags.BoolVar(&printStats, "stats", printStatsDefault, "Print cache statistics on exit (env: PRINT_STATS)")
@@ -112,8 +107,8 @@ func runServerCommand() {
 	serverFlags.BoolVar(&compression, "compression", compressionDefault, "Enable LZ4 compression for backend storage (env: COMPRESSION)")
 	serverFlags.BoolVar(&asyncBackend, "async-backend", asyncBackendDefault, "Enable async backend writer for non-blocking PUT operations (env: ASYNC_BACKEND)")
 	serverFlags.BoolVar(&readOnly, "read-only", readOnlyDefault, "Read-only mode: allow cache reads but skip writes (env: READ_ONLY)")
-	serverFlags.BoolVar(&backendFallback, "backend-fallback", backendFallbackDefault, "Never fail a build on backend errors: treat them as cache misses, use only the local cache if the backend can't be reached at startup or keeps failing (env: BACKEND_FALLBACK)")
-	serverFlags.DurationVar(&backendTimeout, "backend-timeout", backendTimeoutDefault, "Timeout for each backend request, e.g. 10s; 0 means no timeout. S3 only (env: BACKEND_TIMEOUT)")
+	serverFlags.BoolVar(&backendFallback, "backend-fallback", backendFallbackDefault, "Fall back to the local cache on backend errors instead of failing the build (env: BACKEND_FALLBACK)")
+	serverFlags.DurationVar(&backendTimeout, "backend-timeout", backendTimeoutDefault, "Per-request timeout for remote backend operations, e.g. 10s; 0 means no timeout (env: BACKEND_TIMEOUT)")
 
 	serverFlags.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags]\n\n", os.Args[0])
@@ -142,8 +137,8 @@ func runServerCommand() {
 		fmt.Fprintf(os.Stderr, "  COMPRESSION      Enable LZ4 compression (true/false)\n")
 		fmt.Fprintf(os.Stderr, "  ASYNC_BACKEND    Enable async backend writer (true/false)\n")
 		fmt.Fprintf(os.Stderr, "  READ_ONLY        Read-only mode: allow reads, skip writes (true/false)\n")
-		fmt.Fprintf(os.Stderr, "  BACKEND_FALLBACK Treat backend errors as cache misses (true/false)\n")
-		fmt.Fprintf(os.Stderr, "  BACKEND_TIMEOUT  Timeout for each backend request, e.g. 10s (S3 only)\n")
+		fmt.Fprintf(os.Stderr, "  BACKEND_FALLBACK Fall back to the local cache on backend errors (true/false)\n")
+		fmt.Fprintf(os.Stderr, "  BACKEND_TIMEOUT  Per-request timeout for remote backend operations, e.g. 10s\n")
 		fmt.Fprintf(os.Stderr, "\nNote: Command-line flags take precedence over environment variables.\n")
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  # Run with disk backend using flags:\n")
@@ -377,7 +372,7 @@ func runServer() {
 		fmt.Fprintf(os.Stderr, "[INFO] Read-only mode enabled: cache reads allowed, writes skipped\n")
 	}
 
-	prog, err := NewCacheProg(backend, lockingGroup, cacheDir, debug, printStats, compression, readOnly, statsDir)
+	prog, err := NewCacheProg(backend, lockingGroup, cacheDir, debug, printStats, compression, readOnly, statsDir, backendFallback)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating cache program: %v\n", err)
 		os.Exit(1)
@@ -429,6 +424,10 @@ func clearLocalCache(cacheDir string) error {
 }
 
 func createBackend() (backends.Backend, error) {
+	if backendTimeout < 0 {
+		return nil, fmt.Errorf("backend timeout must be non-negative, got %v", backendTimeout)
+	}
+
 	backendType = strings.ToLower(backendType)
 
 	var backend backends.Backend
@@ -455,7 +454,9 @@ func createBackend() (backends.Backend, error) {
 			return nil, fmt.Errorf("GCS bucket is required for GCS backend (set via -gcs-bucket flag or GCS_BUCKET env var)")
 		}
 
-		backend, err = backends.NewGCS(gcsBucket, gcsPrefix)
+		backend, err = backends.NewGCS(gcsBucket, gcsPrefix, backends.GCSConfig{
+			Timeout: backendTimeout,
+		})
 
 	case "azblob":
 		if azblobContainer == "" {
@@ -482,8 +483,12 @@ func createBackend() (backends.Backend, error) {
 		if !backendFallback {
 			return nil, err
 		}
-		logger.Warn("backend unavailable, using only the local cache for this build", "backend", backendType, "error", err)
+		logger.Warn("backend unavailable at startup, using only the local cache for this build", "backend", backendType, "error", err)
 		backend = backends.NewNoop()
+		if debug {
+			backend = backends.NewDebug(backend)
+		}
+		return backend, nil
 	}
 
 	// Wrap with error backend if error rate is configured
@@ -492,9 +497,9 @@ func createBackend() (backends.Backend, error) {
 		fmt.Fprintf(os.Stderr, "[INFO] Error injection enabled with rate: %.2f%%\n", errorRate*100)
 	}
 
-	// Inside the async writer, so failures of async PUTs are counted too.
-	if backendFallback {
-		backend = backends.NewFallback(backend, fallbackMaxConsecutiveErrors, logger)
+	// Wrap inside the async writer so failures from async PUTs also trip the circuit breaker.
+	if backendFallback && (backendType != "disk" || errorRate > 0) {
+		backend = backends.NewCircuitBreaker(backend, backends.DefaultMaxConsecutiveErrors, logger)
 	}
 
 	// Wrap with async backend if enabled
@@ -548,6 +553,7 @@ func resolveAzBlobConfig() backends.AzBlobConfig {
 		Account:          getEnvWithPrefix("AZURE_ACCOUNT", ""),
 		ConnectionString: getEnvWithPrefix("AZURE_STORAGE_CONNECTION_STRING", ""),
 		SASToken:         getEnvWithPrefix("AZURE_SAS_TOKEN", ""),
+		Timeout:          backendTimeout,
 	}
 }
 
@@ -649,4 +655,30 @@ func getEnvFloatWithPrefix(key string, defaultValue float64) float64 {
 		// Invalid prefixed value, fall through to unprefixed
 	}
 	return getEnvFloat(key, defaultValue)
+}
+
+// getEnvDuration gets a time.Duration environment variable (e.g. "10s") or returns a default value.
+func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return defaultValue
+	}
+	return d
+}
+
+// getEnvDurationWithPrefix gets a time.Duration environment variable, checking for GOBUILDCACHE_ prefix first.
+// This allows users to use either GOBUILDCACHE_<KEY> or <KEY> for configuration.
+// The prefixed version takes precedence if set, but falls back to unprefixed if the prefixed value is invalid.
+func getEnvDurationWithPrefix(key string, defaultValue time.Duration) time.Duration {
+	if value := os.Getenv("GOBUILDCACHE_" + key); value != "" {
+		if d, err := time.ParseDuration(value); err == nil {
+			return d
+		}
+		// Invalid prefixed value, fall through to unprefixed
+	}
+	return getEnvDuration(key, defaultValue)
 }
