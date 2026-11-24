@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -665,14 +664,9 @@ func (cp *CacheProg) handlePut(req *Request) (Response, error) {
 		if err != nil {
 			// Local cache is still valid even if backend fails
 			cp.failedBackendPuts.Add(1)
-			if errors.Is(err, backends.ErrCircuitOpen) {
-				cp.logger.Debug("backend PUT skipped (circuit open)",
-					"actionID", hex.EncodeToString(req.ActionID))
-			} else {
-				cp.logger.Warn("backend PUT failed, but local cache succeeded",
-					"actionID", hex.EncodeToString(req.ActionID),
-					"error", err)
-			}
+			cp.logger.Warn("backend PUT failed, but local cache succeeded",
+				"actionID", hex.EncodeToString(req.ActionID),
+				"error", err)
 		} else {
 			// Track bytes written to backend on success (actual bytes transferred)
 			cp.backendBytesWritten.Add(dataSize)
@@ -860,14 +854,9 @@ func (cp *CacheProg) handleBackendGetError(actionID []byte, err error) (*getResu
 		return nil, err
 	}
 	cp.failedGets.Add(1)
-	if errors.Is(err, backends.ErrCircuitOpen) {
-		cp.logger.Debug("backend GET skipped (circuit open), treating as cache miss",
-			"actionID", hex.EncodeToString(actionID))
-	} else {
-		cp.logger.Warn("backend GET failed, treating as cache miss",
-			"actionID", hex.EncodeToString(actionID),
-			"error", err)
-	}
+	cp.logger.Warn("backend GET failed, treating as cache miss",
+		"actionID", hex.EncodeToString(actionID),
+		"error", err)
 	return &getResult{miss: true}, nil
 }
 

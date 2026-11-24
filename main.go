@@ -497,11 +497,6 @@ func createBackend() (backends.Backend, error) {
 		fmt.Fprintf(os.Stderr, "[INFO] Error injection enabled with rate: %.2f%%\n", errorRate*100)
 	}
 
-	// Wrap inside the async writer so failures from async PUTs also trip the circuit breaker.
-	if backendFallback && (backendType != "disk" || errorRate > 0) {
-		backend = backends.NewCircuitBreaker(backend, backends.DefaultMaxConsecutiveErrors, logger)
-	}
-
 	// Wrap with async backend if enabled
 	if asyncBackend {
 		backend = backends.NewAsyncBackendWriter(backend, logger)
