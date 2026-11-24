@@ -88,7 +88,7 @@ func runServerCommand() {
 		asyncBackendDefault    = getEnvBoolWithPrefix("ASYNC_BACKEND", true)
 		readOnlyDefault        = getEnvBoolWithPrefix("READ_ONLY", false)
 		backendFallbackDefault = getEnvBoolWithPrefix("BACKEND_FALLBACK", false)
-		backendTimeoutDefault  = getEnvDurationWithPrefix("BACKEND_TIMEOUT", 0)
+		backendTimeoutDefault  = getEnvDurationWithPrefix("BACKEND_TIMEOUT", backends.DefaultBackendTimeout)
 	)
 	serverFlags.BoolVar(&debug, "debug", debugDefault, "Enable debug logging to stderr (env: DEBUG)")
 	serverFlags.BoolVar(&printStats, "stats", printStatsDefault, "Print cache statistics on exit (env: PRINT_STATS)")
@@ -108,7 +108,7 @@ func runServerCommand() {
 	serverFlags.BoolVar(&asyncBackend, "async-backend", asyncBackendDefault, "Enable async backend writer for non-blocking PUT operations (env: ASYNC_BACKEND)")
 	serverFlags.BoolVar(&readOnly, "read-only", readOnlyDefault, "Read-only mode: allow cache reads but skip writes (env: READ_ONLY)")
 	serverFlags.BoolVar(&backendFallback, "backend-fallback", backendFallbackDefault, "Fall back to the local cache on backend errors instead of failing the build (env: BACKEND_FALLBACK)")
-	serverFlags.DurationVar(&backendTimeout, "backend-timeout", backendTimeoutDefault, "Per-request timeout for remote backend operations, e.g. 10s; 0 means no timeout (env: BACKEND_TIMEOUT)")
+	serverFlags.DurationVar(&backendTimeout, "backend-timeout", backendTimeoutDefault, "Per-request timeout for remote backend operations, e.g. 30s; 0 disables (env: BACKEND_TIMEOUT)")
 
 	serverFlags.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags]\n\n", os.Args[0])
@@ -138,7 +138,7 @@ func runServerCommand() {
 		fmt.Fprintf(os.Stderr, "  ASYNC_BACKEND    Enable async backend writer (true/false)\n")
 		fmt.Fprintf(os.Stderr, "  READ_ONLY        Read-only mode: allow reads, skip writes (true/false)\n")
 		fmt.Fprintf(os.Stderr, "  BACKEND_FALLBACK Fall back to the local cache on backend errors (true/false)\n")
-		fmt.Fprintf(os.Stderr, "  BACKEND_TIMEOUT  Per-request timeout for remote backend operations, e.g. 10s\n")
+		fmt.Fprintf(os.Stderr, "  BACKEND_TIMEOUT  Per-request timeout for remote backend operations, e.g. 30s (0 disables)\n")
 		fmt.Fprintf(os.Stderr, "\nNote: Command-line flags take precedence over environment variables.\n")
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  # Run with disk backend using flags:\n")

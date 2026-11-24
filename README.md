@@ -403,7 +403,7 @@ All environment variables support both `GOBUILDCACHE_<KEY>` and `<KEY>` forms (e
 | `-stats-dir` | `GOBUILDCACHE_STATS_DIR` | (empty, disabled) | Directory to write a JSON statistics file to on exit, one `gobuildcache-stats-<unixnanos>-<pid>.json` per process. Works independently of `-stats` |
 | `-read-only` | `GOBUILDCACHE_READ_ONLY` | `false` | Read-only mode: allow cache reads but skip writes |
 | `-backend-fallback` | `GOBUILDCACHE_BACKEND_FALLBACK` | `false` | Fall back to the local cache on backend errors instead of failing the build: failed GETs (including body read errors) become misses, and after 5 consecutive failures the remote backend is bypassed for the rest of the process. Failures are logged as warnings and still counted in stats |
-| `-backend-timeout` | `GOBUILDCACHE_BACKEND_TIMEOUT` | `0` (none) | Per-request timeout for remote backend operations (S3, GCS, Azure), in Go duration syntax (e.g. `10s`). Covers startup bucket checks, PUTs, and GETs including reading the response body, so leave room for large objects |
+| `-backend-timeout` | `GOBUILDCACHE_BACKEND_TIMEOUT` | `30s` | Per-request timeout for remote backend operations (S3, GCS, Azure), in Go duration syntax (e.g. `10s`; `0` disables). Covers startup bucket checks, PUTs, and GETs including reading the response body, so leave room for large objects |
 | (env var only) | `GOBUILDCACHE_AWS_REGION` | (none) | AWS region for S3 backend (falls back to `AWS_REGION`) |
 | (env var only) | `GOBUILDCACHE_AWS_ACCESS_KEY_ID` | (none) | AWS access key for S3 backend (falls back to `AWS_ACCESS_KEY_ID`) |
 | (env var only) | `GOBUILDCACHE_AWS_SECRET_ACCESS_KEY` | (none) | AWS secret key for S3 backend (falls back to `AWS_SECRET_ACCESS_KEY`) |

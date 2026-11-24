@@ -6,6 +6,10 @@ import (
 	"time"
 )
 
+// DefaultBackendTimeout is the default per-request timeout for remote backend
+// operations when -backend-timeout / BACKEND_TIMEOUT is not configured.
+const DefaultBackendTimeout = 30 * time.Second
+
 func noopCancel() {}
 
 // requestContext returns a context bounded by timeout. When timeout <= 0, it
